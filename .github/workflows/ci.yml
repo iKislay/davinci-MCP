@@ -1,0 +1,167 @@
+name: CI
+
+# Until this existed, nothing ran on a pull request. The drift guards and the
+# suite only gated a `v*` tag — i.e. after the merge — so a PR could sit open
+# claiming "all tests pass" with 23 of them red, which is exactly what happened
+# on #181. Run the same checks where they can still change the outcome.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      # Report every version, not just the first to fail.
+      fail-fast: false
+      matrix:
+        # 3.10 is the declared floor and the only place some breakage shows:
+        # FastMCP inferred a broken output schema from `-> Any` on 3.10 alone
+        # (issue #314), and a 3.11-only CI shipped it.
+        python-version: ["3.10", "3.11"]
+    name: test (Python ${{ matrix.python-version }})
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          # Above the repo's >=20.9 floor. The managed-install sync tests skip
+          # themselves under an older Node rather than passing for the wrong
+          # reason, so a floor regression here would go quiet, not red.
+          node-version: "22"
+
+      - name: Install ffmpeg
+        # A real dependency, not a test crutch: waveform silence detection,
+        # loudness measurement and sync-event detection all shell out to it.
+        # Most tests skip without it, but not all — and the ones that do skip
+        # are the ones worth actually running.
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install advanced-server Node dependencies
+        # The Python offline-fallback tier shells into resolve-advanced's
+        # vendored codecs, which require jszip and friends. Same install the
+        # managed setup performs, so CI exercises the layout users get.
+        run: npm install --omit=dev --omit=optional --no-audit --no-fund
+        working-directory: resolve-advanced
+
+      - name: Install Python dependencies
+        # requirements.txt plus what the suite itself imports. Kept explicit
+        # rather than pulled from the venv install.py builds: this job must
+        # fail when a test grows an undeclared dependency, not paper over it.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pyflakes numpy pillow requests
+
+      - name: Run the offline test suite
+        # No Resolve on the runner; the suite stubs DaVinciResolveScript and is
+        # expected to be fully green offline.
+        run: python -m pytest tests -q
+
+      - name: Run drift guards
+        # The same guards the publish workflow runs on a tag — generated agent
+        # rule files, doc tool counts, action lists, the api_truth ledger, the
+        # control-panel guide — checked before the merge instead of after.
+        run: |
+          python scripts/audit_api_parity.py
+          python scripts/gen_api_limitations.py --check
+          python scripts/audit_readwrite_symmetry.py --check
+          node scripts/agent-rules/generate.mjs --check
+          python -m unittest tests.test_static_undefined_names tests.test_duplicate_definitions tests.test_action_list_drift tests.test_panel_docs_drift tests.test_doc_tool_counts tests.test_agent_rules_drift tests.test_import
+
+      - name: Run Node CLI smoke tests
+        run: |
+          node bin/davinci-resolve-mcp.mjs --help
+          node bin/davinci-resolve-mcp.mjs --version
+          node bin/davinci-resolve-advanced-mcp.mjs --version
+
+      - name: Check the managed install can boot the advanced server
+        # Issue #179: setup registered a bin whose module tree the managed
+        # install never received, and the failure only showed up in a client.
+        # Sync for real, then complete an MCP handshake against the result.
+        shell: bash
+        run: |
+          export DAVINCI_RESOLVE_MCP_INSTALL_ROOT="$(mktemp -d)/managed"
+          node bin/davinci-resolve-mcp.mjs sync
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | node "$DAVINCI_RESOLVE_MCP_INSTALL_ROOT/bin/davinci-resolve-advanced-mcp.mjs" > handshake.jsonl
+          python - <<'PY'
+          import json, sys
+          tools = None
+          for line in open("handshake.jsonl", encoding="utf-8"):
+              try:
+                  message = json.loads(line)
+              except ValueError:
+                  continue
+              if message.get("id") == 2:
+                  tools = message["result"]["tools"]
+          if not tools:
+              sys.exit("::error::the advanced server never answered tools/list from the managed install")
+          print(f"advanced server booted from the managed install: {len(tools)} tools")
+          PY
+
+      - name: Check npm package contents
+        run: npm pack --dry-run
+
+      - name: Check for whitespace damage
+        run: git diff --check
+
+  advanced-node:
+    # The advanced server's own suite. The job above only installs
+    # resolve-advanced's production deps for the Python fallback tier; it never
+    # ran `npm test`, so code needing Node 22.15+ zlib zstd passed a green
+    # check while failing on the declared >=20.9 floor (PR #312).
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 = the engines.node floor, 22 = current LTS.
+        node-version: ["20", "22"]
+    name: advanced suite (Node ${{ matrix.node-version }})
+    defaults:
+      run:
+        working-directory: resolve-advanced
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install ffmpeg
+        # Audio and conform frame tests shell out to ffmpeg/ffprobe and skip
+        # without them.
+        working-directory: .
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        # A clean `npm ci` per Node version, with no dependency cache:
+        # better-sqlite3 is a native addon built for one Node ABI, and a
+        # node_modules from another version fails to load (ERR_DLOPEN_FAILED).
+        run: npm ci --no-audit --no-fund
+
+      - name: Run the advanced test suite
+        run: npm test
+
+
